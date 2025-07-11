@@ -1,34 +1,13 @@
 #include <iostream>
 #include <cuda_runtime.h>
 #include <assert.h>
+#include "genann_cuda.cuh"
 #include "genann.h"
 
-#define TILE_WIDTH 32
-#define CUDA_CHECK(err) {if (err != cudaSuccess){printf("%s in %s at line %d \n", cudaGetErrorString(err), __FILE__, __LINE__);exit(EXIT_FAILURE);}}
-
-__device__ double genann_act_linear_cuda(double a){
-    return a;
-}
-
-__device__ double genann_act_threshold_cuda(double a){
-    return a > 0;
-}
-
-__device__ double genann_act_sigmoid_cuda(double a)
-{
-    if (a < -45.0)
-        return 0;
-    if (a > 45.0)
-        return 1;
-    return 1.0 / (1 + exp(-a));
-}
-
-__global__ void tiled_mat_mul_kernel(double* A, double* B, double* C, int N1, int N2, int N3){
-    // Ensure that TILE_WIDTH = BLOCK_SIZE
+__global__ void tiled_mat_mul_kernel(float* A, float* B, float* C, int N1, int N2, int N3){
     assert(TILE_WIDTH == blockDim.x);
     assert(TILE_WIDTH == blockDim.y);
     
-    // Details regarding this thread
     int by = blockIdx.y;
     int bx = blockIdx.x; 
 
@@ -40,13 +19,12 @@ __global__ void tiled_mat_mul_kernel(double* A, double* B, double* C, int N1, in
     int j = TILE_WIDTH*bx + tx;
 
     // Allocating shared memory
-    __shared__ double sh_A[TILE_WIDTH][TILE_WIDTH];
-    __shared__ double sh_B[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float sh_A[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float sh_B[TILE_WIDTH][TILE_WIDTH];
 
     // Parallel mat mul
-    double value = 0;
-    for (int phase = 0; phase < ceil((double)N2/TILE_WIDTH); phase++){
-        // Load Tiles into shared memory
+    float value = 0;
+    for (int phase = 0; phase < ceil((float)N2/TILE_WIDTH); phase++){
         if ((i < N1) && ((phase*TILE_WIDTH+tx) < N2))
           sh_A[ty][tx] = A[(i)*N2 + phase*TILE_WIDTH+tx];
         else
@@ -63,13 +41,12 @@ __global__ void tiled_mat_mul_kernel(double* A, double* B, double* C, int N1, in
             value += sh_A[ty][k] * sh_B[k][tx];
         __syncthreads();
     }
-    // Assigning calculated value
     if ((i < N1) && (j < N3))
       C[i*N3+j] = value;
 }
 
 // Applying activation functions
-__global__ void apply_activation_kernel(double* data, int size, int activation_type) {
+__global__ void apply_activation_kernel(float* data, int size, int activation_type) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         switch(activation_type){
@@ -86,52 +63,19 @@ __global__ void apply_activation_kernel(double* data, int size, int activation_t
     }
 }
 
-void tiled_mat_mul_gpu(double* A, double* B, double* C, int N1, int N2, int N3){
-
-    // Device array pointers
-    double* d_A;
-    double* d_B;
-    double* d_C;
-
-    // Device memory allocation
-    cudaError_t err_A = cudaMalloc((void**) &d_A, N1*N2*sizeof(double));
-    CUDA_CHECK(err_A);
-
-    cudaError_t err_B = cudaMalloc((void**) &d_B, N2*N3*sizeof(double));
-    CUDA_CHECK(err_B);
-
-    cudaError_t err_C = cudaMalloc((void**) &d_C, N1*N3*sizeof(double));
-    CUDA_CHECK(err_C);
-
-    // Copying A and B to device memory
-    cudaError_t err_A_ = cudaMemcpy(d_A, A, N1*N2*sizeof(double), cudaMemcpyHostToDevice);
-    CUDA_CHECK(err_A_);
-
-    cudaError_t err_B_ = cudaMemcpy(d_B, B, N2*N3*sizeof(double), cudaMemcpyHostToDevice);
-    CUDA_CHECK(err_B_);
-
-    // Kernel execution
-    dim3 dim_block(TILE_WIDTH, TILE_WIDTH, 1);
-    dim3 dim_grid(ceil(N3/(double)(TILE_WIDTH)), ceil(N1/(double)(TILE_WIDTH)), 1);
-    tiled_mat_mul_kernel<<<dim_grid, dim_block>>>(d_A, d_B, d_C, N1, N2, N3);
-
-    // Copy back results
-    cudaError_t err_C_ = cudaMemcpy(C, d_C, N1*N3*sizeof(double), cudaMemcpyDeviceToHost);
-    CUDA_CHECK(err_C_);
-
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
+// Set bias on the array
+__global__ void set_bias(float* d_input, int bias_index) {
+    d_input[bias_index] = -1.0;
 }
 
-void launch_activation_kernel(double* d_data, int size, int activation_function, double steepness) {
+void launch_activation_kernel(float* d_data, int size, int activation_function) {
     unsigned int block_size = 256;
     unsigned int grid_size = (size + block_size - 1) / block_size;
-    apply_activation_kernel<<<grid_size, block_size>>>(d_data, size, activation_function, steepness);
+    apply_activation_kernel<<<grid_size, block_size>>>(d_data, size, activation_function);
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-double *genann_run_cuda(genann *ann, double *input){
+float *genann_run_cuda(genann *ann, float *input){
 
     if (!ann || !input) {
         fprintf(stderr, "Error: ann or input is NULL in genann_run_cuda.\n");
@@ -139,8 +83,8 @@ double *genann_run_cuda(genann *ann, double *input){
     }
 
     // Allocate device memory for input and output of each layer
-    double* output; // memory layout: [inputs,outputs]
-    double* weights;
+    float* output; // memory layout: [inputs,outputs]
+    float* weights;
 
     // Get information
     unsigned int num_total_neurons = ann->total_neurons;
@@ -150,67 +94,85 @@ double *genann_run_cuda(genann *ann, double *input){
     unsigned int num_output = ann->outputs;
     unsigned int num_hidden_layers = ann->hidden_layers;
 
-    // Allocate initial input and output for each neuron on the device
-    CUDA_CHECK(cudaMalloc((void**)&output, num_total_neurons * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(output, input, num_input * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc((void**)&weights, num_total_weight * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(weights, ann->weight, num_total_weight * sizeof(double), cudaMemcpyHostToDevice));
+    enum GenannActivationType activation_hidden_type = ann->activation_hidden_type;
+    enum GenannActivationType activation_output_type = ann->activation_output_type;
 
-    // Loop through each layer
-    for (unsigned int l = 0; l < num_hidden_layers + 1; l++) {
-        unsigned int M = ann->weight_matrices_size[l * 2]; 
-        unsigned int K = ann->weight_matrices_size[l * 2 + 1];
+    // Calculate the number of bias neuron that need to be pre-appended to the output array
+    unsigned int num_neuron_append = num_hidden_layers + 1;
 
-        // Allocate device memory for the weight matrix of the current layer
-        double* d_weight_matrix;
-        CUDA_CHECK(cudaMalloc((void**)&d_weight_matrix, M * K * sizeof(double)));
-        CUDA_CHECK(cudaMemcpy(d_weight_matrix, ann->weight_matrices[l], M * K * sizeof(double), cudaMemcpyHostToDevice));
+    // Allocate host memory for output
+    float* host_output = (float*)malloc(num_output * sizeof(float));
 
-        // Allocate device memory for the output of this layer (before activation), input for the next matrix multiplication
-        unsigned int next_input_size = M; // Number of neurons in the next layer
-        CUDA_CHECK(cudaMalloc((void**)&d_next_layer_output, next_input_size * sizeof(double)));
+    // Allocate initial input and output for each neuron on the device, bias also included
+    CUDA_CHECK(cudaMalloc((void**)&output, (num_total_neurons + num_neuron_append) * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(output, input, num_input * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // Set the bias neuron
+    set_bias<<<1,1>>>(output, num_input);
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-        // input (1 x K), weight_matrix (M x K).
-        // weight matrix as K rows, M columns (transposed).
-        tiled_mat_mul_gpu(d_weight_matrix, d_current_input, d_next_layer_output, M, K, 1);
+    // Allocate the weights to the device
+    CUDA_CHECK(cudaMalloc((void**)&weights, num_total_weight * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(weights, ann->weight, num_total_weight * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Device pointer arithemtic
+    float* d_input = output;
+    float* d_result = output + num_input + 1;
+    float* d_weight = weights;
+
+    // Dimension initialization for block dimension
+    dim3 dim_block(TILE_WIDTH, TILE_WIDTH, 1);
+
+    if(!num_hidden){
+        dim3 dim_grid(ceil(num_output/(float)(TILE_WIDTH)), ceil((num_input + 1)/(float)(TILE_WIDTH)), 1); // Dimension initialization for grid dimension
+        // Kernel execution with no hidden layer
+        tiled_mat_mul_kernel<<<dim_grid, dim_block>>>(d_input, d_weight, d_result, 1, (num_input + 1), num_output);
         CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Apply activation function
-        enum fann_activationfunc_enum activation_func = ann->activations[l];
-        double steepness = ann->activation_steepnesses[l];
-        launch_activation_kernel(d_next_layer_output, next_input_size, activation_func, steepness);
+        launch_activation_kernel(d_result, num_output, activation_output_type);
         CUDA_CHECK(cudaDeviceSynchronize());
+    }else{
+        dim3 dim_grid(ceil(num_hidden/(float)(TILE_WIDTH)), ceil((num_input + 1)/(float)(TILE_WIDTH)), 1); // Dimension initialization for grid dimension
+        
+        // Kernel execution for input to hidden layer
+        tiled_mat_mul_kernel<<<dim_grid, dim_block>>>(d_input, d_weight, d_result, 1, (num_input + 1), num_hidden);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        launch_activation_kernel(d_result, num_hidden, activation_hidden_type);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        d_input += (num_input + 1);
+        d_weight += ((num_input + 1) * num_hidden);
+        set_bias<<<1,1>>>(d_result, (num_hidden)); // Set the bias neuron
+        CUDA_CHECK(cudaDeviceSynchronize());
+        d_result += (num_hidden + 1);
 
-        // Free the previous layer's input 
-        if (l > 0) {
-            CUDA_CHECK(cudaFree(d_current_input));
+
+        // Kernel execution for subsequent hidden layer
+        for(int i = 1; i < num_hidden_layers; i++){
+            dim3 dim_grid_hidden(ceil(num_hidden/(float)(TILE_WIDTH)), ceil((num_hidden + 1)/(float)(TILE_WIDTH)), 1); // Dimension initialization for grid dimension
+            
+            tiled_mat_mul_kernel<<<dim_grid_hidden, dim_block>>>(d_input, d_weight, d_result, num_hidden, (num_hidden + 1), num_hidden);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            launch_activation_kernel(d_result, num_hidden, activation_hidden_type);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            d_input += (num_hidden + 1);
+            d_weight += (num_hidden * num_hidden);
+            set_bias<<<1,1>>>(d_result, (num_hidden)); // Set the bias neuron
+            CUDA_CHECK(cudaDeviceSynchronize());
+            d_result += (num_hidden + 1);
         }
 
-        // The output of this layer becomes the input for the next layer
-        d_current_input = d_next_layer_output;
+        dim3 dim_grid_output(ceil(num_output/(float)(TILE_WIDTH)), ceil((num_hidden + 1)/(float)(TILE_WIDTH)), 1); // Dimension initialization for grid dimension
 
-        // Free the weight matrix for the current layer
-        CUDA_CHECK(cudaFree(d_weight_matrix));
+        // Kernel execution for hidden to output layer
+        tiled_mat_mul_kernel<<<dim_grid_output, dim_block>>>(d_input, d_weight, d_result, 1, (num_hidden + 1), num_output);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        launch_activation_kernel(d_result, num_output, activation_output_type);
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 
-    // Allocate host memory for the final output
-    double* host_output = (double*)malloc(num_output_neurons * sizeof(double));
-    if (!host_output) {
-        fprintf(stderr, "Error: Failed to allocate host memory for final output.\n");
-        CUDA_CHECK(cudaFree(d_current_input));
-        return NULL;
-    }
+    CUDA_CHECK(cudaMemcpy(host_output, d_result, num_output * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // Copy the final output from device to host
-    CUDA_CHECK(cudaMemcpy(host_output, d_current_input, num_output_neurons * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(output));
+    CUDA_CHECK(cudaFree(weights));
 
-    // Store final output in ann
-    if (ann->final_output) {
-        free(ann->final_output);
-    }
-    ann->final_output = host_output;
-
-    CUDA_CHECK(cudaFree(d_current_input));
-
-    return ann->final_output;
+    return host_output;
 }

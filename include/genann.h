@@ -50,6 +50,12 @@ extern "C"
         GENANN_ACT_SIGMOID = 2
     };
 
+    enum GenannRunType
+    {
+        INTERNAL = 0,
+        EXTERNAL = 1
+    };
+
     typedef struct genann
     {
         /* How many inputs, outputs, and hidden neurons. */
@@ -76,8 +82,15 @@ extern "C"
         /* Stores input array and output of each neuron (total_neurons long). */
         float *output;
 
+        /* Stores input array and output of each neuron also with bias neuron (total_neuron + num_hidden + 1) */
+        float *output_cuda;
+
         /* Stores delta of each hidden and output neuron (total_neurons - inputs long). */
         float *delta;
+
+        /* Pointers to device memory, shouldn't be modify by users */
+        float *d_weights;
+        float *d_output;
 
     } genann;
 

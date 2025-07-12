@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <cuda_runtime.h>
 
 #ifndef genann_act
 #define genann_act_hidden genann_act_hidden_indirect
@@ -136,7 +137,7 @@ genann *genann_init(int inputs, int hidden_layers, int hidden, int outputs)
 
     /* Allocate extra size for weights, outputs, and deltas. */
     const int size = sizeof(genann) + sizeof(float) * (total_weights + total_neurons + (total_neurons - inputs));
-    genann *ret = malloc(size);
+    genann *ret = (genann *) malloc(size);
     if (!ret)
         return 0;
 
@@ -158,8 +159,8 @@ genann *genann_init(int inputs, int hidden_layers, int hidden, int outputs)
     ret->activation_hidden = genann_act_sigmoid_cached;
     ret->activation_output = genann_act_sigmoid_cached;
 
-    ret->activation_hidden_type = 2;
-    ret->activation_output_type = 2;
+    ret->activation_hidden_type = GENANN_ACT_SIGMOID;
+    ret->activation_output_type = GENANN_ACT_SIGMOID;
 
     genann_init_sigmoid_lookup(ret);
 
@@ -201,7 +202,7 @@ genann *genann_read(FILE *in)
 genann *genann_copy(genann const *ann)
 {
     const int size = sizeof(genann) + sizeof(float) * (ann->total_weights + ann->total_neurons + (ann->total_neurons - ann->inputs));
-    genann *ret = malloc(size);
+    genann *ret = (genann *) malloc(size);
     if (!ret)
         return 0;
 
@@ -228,6 +229,20 @@ void genann_randomize(genann *ann)
 
 void genann_free(genann *ann)
 {
+    if (ann->d_output)
+    {
+        cudaFree(ann->d_output);
+        ann->d_output = NULL;
+    }
+
+    if (ann->d_weights)
+    {
+        cudaFree(ann->d_weights);
+        ann->d_weights = NULL;
+    }
+
+    if (ann->output_cuda)
+        free(ann->output_cuda);
     /* The weight, output, and delta pointers go to the same buffer. */
     free(ann);
 }

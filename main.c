@@ -69,7 +69,7 @@ int main()
         }
         memcpy(input_cuda, input_data[i], inputs * sizeof(float));
 
-        float *output_cuda = genann_run_cuda(ann_cpu, input_cuda); // Call CUDA function
+        float *output_cuda = genann_run_cuda(ann_cpu, input_cuda, EXTERNAL); // Call CUDA function
 
         printf("Input: [%.1f, %.1f], Desired: %.1f, CUDA Output: %.4f\n",
                input_data[i][0], input_data[i][1], output_data[i][0], output_cuda[0]);
@@ -85,7 +85,6 @@ int main()
         }
 
         free(input_cuda);
-        free(output_cuda); // Free memory allocated by genann_run_cuda
     }
 
     // --- Clean up ---

@@ -4,7 +4,10 @@
 #include "genann_cuda.cuh"
 #include "genann.h"
 
-__global__ void tiled_mat_mul_kernel(float* A, float* B, float* C, int N1, int N2, int N3){
+__global__ void tiled_mat_mul_kernel(float* A, float* B, float* C,
+                                     int N1, int N2, int N3,
+                                     bool transpose_A, bool transpose_B)
+{
     assert(TILE_WIDTH == blockDim.x);
     assert(TILE_WIDTH == blockDim.y);
     
@@ -24,16 +27,26 @@ __global__ void tiled_mat_mul_kernel(float* A, float* B, float* C, int N1, int N
 
     // Parallel mat mul
     float value = 0;
-    for (int phase = 0; phase < ceil((float)N2/TILE_WIDTH); phase++){
-        if ((i < N1) && ((phase*TILE_WIDTH+tx) < N2))
-          sh_A[ty][tx] = A[(i)*N2 + phase*TILE_WIDTH+tx];
-        else
-          sh_A[ty][tx] = 0.0f;
+    for (int phase = 0; phase < ((N2 + TILE_WIDTH - 1) / TILE_WIDTH); phase++){
+        if (!transpose_A) {
+            sh_A[ty][tx] = (i < N1 && (phase*TILE_WIDTH+tx) < N2)
+                        ? A[i * N2 + phase*TILE_WIDTH + tx]
+                        : 0.0f;
+        } else {
+            sh_A[ty][tx] = ((phase*TILE_WIDTH+tx) < N2 && i < N1)
+                        ? A[(phase*TILE_WIDTH + tx)*N1 + i]
+                        : 0.0f;
+        }
 
-        if (((phase*TILE_WIDTH + ty) < N2) && (j < N3))
-          sh_B[ty][tx] = B[(phase*TILE_WIDTH + ty)*N3+j];
-        else
-          sh_B[ty][tx] = 0.0f;
+        if (!transpose_B) {
+            sh_B[ty][tx] = ((phase*TILE_WIDTH + ty) < N2 && j < N3)
+                        ? B[(phase*TILE_WIDTH + ty)*N3 + j]
+                        : 0.0f;
+        } else {
+            sh_B[ty][tx] = (j < N2 && (phase*TILE_WIDTH + ty) < N3)
+                        ? B[j*N2 + (phase*TILE_WIDTH + ty)]
+                        : 0.0f;
+        }
         __syncthreads();
 
         // Dot product
@@ -75,18 +88,13 @@ void launch_activation_kernel(float* d_data, int size, int activation_function) 
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-float *genann_run_cuda(genann *ann, float *input){
+float *genann_run_cuda(genann *ann, float const *inputs, enum GenannRunType run_type){
 
-    if (!ann || !input) {
+    if (!ann || !inputs) {
         fprintf(stderr, "Error: ann or input is NULL in genann_run_cuda.\n");
         return NULL;
     }
 
-    // Allocate device memory for input and output of each layer
-    float* output; // memory layout: [inputs,outputs]
-    float* weights;
-
-    // Get information
     unsigned int num_total_neurons = ann->total_neurons;
     unsigned int num_total_weight = ann->total_weights;
     unsigned int num_input = ann->inputs;
@@ -101,24 +109,24 @@ float *genann_run_cuda(genann *ann, float *input){
     unsigned int num_neuron_append = num_hidden_layers + 1;
 
     // Allocate host memory for output
-    float* host_output = (float*)malloc(num_output * sizeof(float));
+    float* host_output = (float*)malloc((num_total_neurons + num_neuron_append) * sizeof(float));
 
     // Allocate initial input and output for each neuron on the device, bias also included
-    CUDA_CHECK(cudaMalloc((void**)&output, (num_total_neurons + num_neuron_append) * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(output, input, num_input * sizeof(float), cudaMemcpyHostToDevice));
+    if (ann->d_output == NULL) CUDA_CHECK(cudaMalloc((void**)&ann->d_output, (num_total_neurons + num_neuron_append) * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(ann->d_output, inputs, num_input * sizeof(float), cudaMemcpyHostToDevice));
     
     // Set the bias neuron
-    set_bias<<<1,1>>>(output, num_input);
+    set_bias<<<1,1>>>(ann->d_output, num_input);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Allocate the weights to the device
-    CUDA_CHECK(cudaMalloc((void**)&weights, num_total_weight * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(weights, ann->weight, num_total_weight * sizeof(float), cudaMemcpyHostToDevice));
-
+    if (ann->d_weights == NULL) CUDA_CHECK(cudaMalloc((void**)&ann->d_weights, num_total_weight * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(ann->d_weights, ann->weight, num_total_weight * sizeof(float), cudaMemcpyHostToDevice));
+    
     // Device pointer arithemtic
-    float* d_input = output;
-    float* d_result = output + num_input + 1;
-    float* d_weight = weights;
+    float* d_input = ann->d_output;
+    float* d_result = ann->d_output + num_input + 1;
+    float* d_weight = ann->d_weights;
 
     // Dimension initialization for block dimension
     dim3 dim_block(TILE_WIDTH, TILE_WIDTH, 1);
@@ -126,7 +134,7 @@ float *genann_run_cuda(genann *ann, float *input){
     if(!num_hidden){
         dim3 dim_grid(ceil(num_output/(float)(TILE_WIDTH)), ceil((num_input + 1)/(float)(TILE_WIDTH)), 1); // Dimension initialization for grid dimension
         // Kernel execution with no hidden layer
-        tiled_mat_mul_kernel<<<dim_grid, dim_block>>>(d_input, d_weight, d_result, 1, (num_input + 1), num_output);
+        tiled_mat_mul_kernel<<<dim_grid, dim_block>>>(d_input, d_weight, d_result, 1, (num_input + 1), num_output, false, false);
         CUDA_CHECK(cudaDeviceSynchronize());
         launch_activation_kernel(d_result, num_output, activation_output_type);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -134,7 +142,7 @@ float *genann_run_cuda(genann *ann, float *input){
         dim3 dim_grid(ceil(num_hidden/(float)(TILE_WIDTH)), ceil((num_input + 1)/(float)(TILE_WIDTH)), 1); // Dimension initialization for grid dimension
         
         // Kernel execution for input to hidden layer
-        tiled_mat_mul_kernel<<<dim_grid, dim_block>>>(d_input, d_weight, d_result, 1, (num_input + 1), num_hidden);
+        tiled_mat_mul_kernel<<<dim_grid, dim_block>>>(d_input, d_weight, d_result, 1, (num_input + 1), num_hidden, false, false);
         CUDA_CHECK(cudaDeviceSynchronize());
         launch_activation_kernel(d_result, num_hidden, activation_hidden_type);
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -149,12 +157,12 @@ float *genann_run_cuda(genann *ann, float *input){
         for(int i = 1; i < num_hidden_layers; i++){
             dim3 dim_grid_hidden(ceil(num_hidden/(float)(TILE_WIDTH)), ceil((num_hidden + 1)/(float)(TILE_WIDTH)), 1); // Dimension initialization for grid dimension
             
-            tiled_mat_mul_kernel<<<dim_grid_hidden, dim_block>>>(d_input, d_weight, d_result, num_hidden, (num_hidden + 1), num_hidden);
+            tiled_mat_mul_kernel<<<dim_grid_hidden, dim_block>>>(d_input, d_weight, d_result, num_hidden, (num_hidden + 1), num_hidden, false, false);
             CUDA_CHECK(cudaDeviceSynchronize());
             launch_activation_kernel(d_result, num_hidden, activation_hidden_type);
             CUDA_CHECK(cudaDeviceSynchronize());
             d_input += (num_hidden + 1);
-            d_weight += (num_hidden * num_hidden);
+            d_weight += ((num_hidden + 1) * num_hidden);
             set_bias<<<1,1>>>(d_result, (num_hidden)); // Set the bias neuron
             CUDA_CHECK(cudaDeviceSynchronize());
             d_result += (num_hidden + 1);
@@ -163,16 +171,38 @@ float *genann_run_cuda(genann *ann, float *input){
         dim3 dim_grid_output(ceil(num_output/(float)(TILE_WIDTH)), ceil((num_hidden + 1)/(float)(TILE_WIDTH)), 1); // Dimension initialization for grid dimension
 
         // Kernel execution for hidden to output layer
-        tiled_mat_mul_kernel<<<dim_grid_output, dim_block>>>(d_input, d_weight, d_result, 1, (num_hidden + 1), num_output);
+        tiled_mat_mul_kernel<<<dim_grid_output, dim_block>>>(d_input, d_weight, d_result, 1, (num_hidden + 1), num_output, false, false);
         CUDA_CHECK(cudaDeviceSynchronize());
         launch_activation_kernel(d_result, num_output, activation_output_type);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
-    CUDA_CHECK(cudaMemcpy(host_output, d_result, num_output * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(host_output, ann->d_output, (num_total_neurons + num_neuron_append) * sizeof(float), cudaMemcpyDeviceToHost));
+    ann->output_cuda = host_output;
+    
+    if(run_type == 1){
+        CUDA_CHECK(cudaFree(ann->d_output));
+        CUDA_CHECK(cudaFree(ann->d_weights));
+        ann->d_output = NULL;
+        ann->d_weights = NULL;
+    }
 
-    CUDA_CHECK(cudaFree(output));
-    CUDA_CHECK(cudaFree(weights));
+    return host_output + (num_total_neurons + num_neuron_append - num_output);
+}
 
-    return host_output;
+void genann_train_cuda(genann *ann, float const *inputs, float const *desired_outputs, float learning_rate){
+    // Get the outputs of each activation
+    genann_run_cuda(ann, inputs, INTERNAL);
+
+    int h, j, k;
+
+    // Set the output layer deltas
+    {
+        float const *o = ann->d_output + (ann->inputs + 1) + (ann->hidden + 1) * ann->hidden_layers; /* First output. */
+        float *d = ann->delta + ann->hidden * ann->hidden_layers;                      /* First delta. */
+        float const *t = desired_outputs;                                              /* First desired output. */
+
+        /* Set output layer deltas. */
+    }
+    
 }

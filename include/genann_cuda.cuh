@@ -28,7 +28,8 @@ __device__ float genann_act_sigmoid_cuda(float a)
 extern "C" {
 #endif
 
-float *genann_run_cuda(genann *ann, float *input);
+float *genann_run_cuda(genann *ann, float const *inputs, enum GenannRunType run_type);
+void genann_train_cuda(genann *ann, float const *inputs, float const *desired_outputs, float learning_rate);
 
 #ifdef __cplusplus
 }
